@@ -1,0 +1,211 @@
+function refreshClassroomAssignments() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Work to do");
+  if (!sheet) throw new Error('Sheet "Work to do" not found.');
+
+  const TIMEZONE = 'Asia/Shanghai';
+  const now = new Date();
+  const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+
+  // ── Headers ──
+  const headers = [
+    'Course Name', 'Title', 'Due', 'Time left: (min)', 'Link',
+    'Status', 'Time left: (days)', 'Time left: (hrs)'
+  ];
+  sheet.clear();
+  sheet.getRange(1, 1, 1, headers.length)
+    .setValues([headers])
+    .setFontWeight('bold')
+    .setBackground('#4285f4')
+    .setFontColor('white');
+
+  // ── Fetch active courses (student view) ──
+  let courses = [];
+  let pageToken = null;
+  do {
+    const response = Classroom.Courses.list({
+      studentId: 'me',
+      courseStates: 'ACTIVE',
+      pageToken: pageToken,
+      pageSize: 100
+    });
+    if (response.courses) courses = courses.concat(response.courses);
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+
+  let allAssignments = [];
+
+  // ── Fetch student submissions & coursework details ──
+  for (const course of courses) {
+    try {
+      let submissions = [];
+      let subToken = null;
+      do {
+        const subResponse = Classroom.Courses.CourseWork.StudentSubmissions.list(
+          course.id,
+          '-',
+          { pageToken: subToken, pageSize: 100 }
+        );
+        if (subResponse.studentSubmissions) {
+          submissions = submissions.concat(subResponse.studentSubmissions);
+        }
+        subToken = subResponse.nextPageToken;
+      } while (subToken);
+
+      const seenWorkIds = new Set();
+
+      for (const sub of submissions) {
+        if (sub.state === 'TURNED_IN' || sub.state === 'RETURNED') continue;
+        if (seenWorkIds.has(sub.courseWorkId)) continue;
+        seenWorkIds.add(sub.courseWorkId);
+
+        let work;
+        try {
+          work = Classroom.Courses.CourseWork.get(course.id, sub.courseWorkId);
+        } catch (e) {
+          console.warn(`Cannot fetch work ${sub.courseWorkId} in ${course.name}: ${e.message}`);
+          continue;
+        }
+
+        let dueDateObj = null;
+        let dueString = '';
+
+        if (work.dueDate) {
+          const y = work.dueDate.year;
+          const m = work.dueDate.month - 1;
+          const d = work.dueDate.day;
+          let hh = 23, mm = 59;
+          if (work.dueTime) {
+            hh = work.dueTime.hours ?? 23;
+            mm = work.dueTime.minutes ?? 59;
+          }
+
+          // FIX: dueTime from API is already UTC — do NOT add/subtract hours
+          const utcMs = Date.UTC(y, m, d, hh, mm);
+          dueDateObj = new Date(utcMs);
+          dueString = Utilities.formatDate(dueDateObj, TIMEZONE, 'yyyy-MM-dd HH:mm');
+        }
+
+        let timeLeftMin = '';
+        let timeLeftHrs = '';
+        let timeLeftDays = '';
+        let status = '';
+
+        if (dueDateObj) {
+          const diffMs = dueDateObj.getTime() - now.getTime();
+          const diffMin = Math.round(diffMs / 60000);
+          const diffHrs = Math.round((diffMs / 3600000) * 10) / 10;
+          const diffDays = Math.round((diffMs / 86400000) * 10) / 10;
+
+          timeLeftMin = diffMin;
+          timeLeftHrs = diffHrs;
+          timeLeftDays = diffDays;
+
+          if (diffMs < 0) status = 'OVERDUE';
+          else if (diffDays <= 1) status = 'DUE SOON';
+          else status = 'UPCOMING';
+        } else {
+          status = 'NO DUE DATE';
+        }
+
+        const link = `https://classroom.google.com/c/${course.id}/a/${work.id}/details`;
+
+        allAssignments.push({
+          courseName: course.name,
+          title: work.title,
+          due: dueString,
+          timeLeftMin: timeLeftMin,
+          link: link,
+          status: status,
+          timeLeftDays: timeLeftDays,
+          timeLeftHrs: timeLeftHrs,
+          dueDateObj: dueDateObj
+        });
+      }
+    } catch (err) {
+      console.warn(`Skipping course "${course.name}": ${err.message}`);
+    }
+  }
+
+  // ── Sort: Overdue (within 3d, latest first) → Upcoming (earliest first) → No due date ──
+  const overdue = [];
+  const upcoming = [];
+  const noDueDate = [];
+
+  for (const a of allAssignments) {
+    if (!a.dueDateObj) {
+      noDueDate.push(a);
+    } else if (a.dueDateObj.getTime() < now.getTime() && a.dueDateObj.getTime() >= threeDaysAgo.getTime()) {
+      overdue.push(a);
+    } else if (a.dueDateObj.getTime() >= now.getTime()) {
+      upcoming.push(a);
+    }
+  }
+
+  overdue.sort((a, b) => b.dueDateObj.getTime() - a.dueDateObj.getTime());
+  upcoming.sort((a, b) => a.dueDateObj.getTime() - b.dueDateObj.getTime());
+
+  const sorted = [...overdue, ...upcoming, ...noDueDate];
+  let nextRow = 2;
+
+  // ── Write data ──
+  if (sorted.length === 0) {
+    sheet.getRange(nextRow, 1).setValue('No pending assignments found.');
+    nextRow++;
+  } else {
+    const rows = sorted.map(a => [
+      a.courseName,
+      a.title,
+      a.due,
+      a.timeLeftMin,
+      a.link,
+      a.status,
+      a.timeLeftDays,
+      a.timeLeftHrs
+    ]);
+
+    sheet.getRange(nextRow, 1, rows.length, headers.length).setValues(rows);
+    nextRow += rows.length;
+
+    // Clickable links
+    const linkRange = sheet.getRange(2, 5, rows.length, 1);
+    const richText = [];
+    for (let i = 0; i < rows.length; i++) {
+      richText.push([SpreadsheetApp.newRichTextValue()
+        .setText('Open Assignment')
+        .setLinkUrl(rows[i][4])
+        .build()]);
+    }
+    linkRange.setRichTextValues(richText);
+
+    // Status colors
+    const statusRange = sheet.getRange(2, 6, rows.length, 1);
+    const statusValues = statusRange.getValues();
+    const colors = statusValues.map(([s]) => {
+      if (s === 'OVERDUE') return ['#ffc7ce'];
+      if (s === 'DUE SOON') return ['#ffeb9c'];
+      if (s === 'UPCOMING') return ['#c6efce'];
+      return ['#d9d9d9'];
+    });
+    statusRange.setBackgrounds(colors);
+
+    sheet.autoResizeColumns(1, headers.length);
+  }
+
+  sheet.setFrozenRows(1);
+
+  // ── Last run time at bottom ──
+  const lastRun = Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd HH:mm:ss');
+
+  sheet.getRange(nextRow + 1, 1)
+    .setValue(`By Desmond ALL RIGHTS RESERVED`)
+    .setFontFamily('Roboto')
+    .setFontSize(20)
+    .setFontColor('#666666');
+
+  sheet.getRange(nextRow + 2, 1)
+    .setValue(`Last updated: ${lastRun} (UTC+8). I bare no responsibility on errors, delays, or missing. btw i cannot fetch languages and arts tasks`)
+    .setFontStyle('italic')
+    .setFontColor('#666666');
+
+}
