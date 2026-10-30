@@ -198,13 +198,13 @@ function refreshClassroomAssignments() {
   const lastRun = Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd HH:mm:ss');
 
   sheet.getRange(nextRow + 1, 1)
-    .setValue(`By Desmond ALL RIGHTS RESERVED`)
+    .setValue(`By KING ALLIANCE ALL RIGHTS RESERVED`)
     .setFontFamily('Roboto')
     .setFontSize(20)
     .setFontColor('#666666');
 
   sheet.getRange(nextRow + 2, 1)
-    .setValue(`Last updated: ${lastRun} (UTC+8). I bare no responsibility on errors, delays, or missing. btw i cannot fetch languages and arts tasks`)
+    .setValue(`Last updated: ${lastRun} (UTC+8). KINGS ALLIANCE bare no responsibility on errors, delays, or missing.`)
     .setFontStyle('italic')
     .setFontColor('#666666');
 
