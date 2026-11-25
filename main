@@ -1,211 +1,1027 @@
-function refreshClassroomAssignments() {
+const CONFIG = {
+  sheetNameAudit: 'Classroom Audit',
+  sheetNameReminders: 'Unsubmitted Tasks',
+  discordEnabled: true,
+  dryRun: false, // ✅ toggle this to false when ready to send
+  discordWebhookUrl: 'https://discord.com/api/webhooks/1412685963473195028/QnCRwbxlcu8FCXZMiGWRi3XH3JFvrpI9acDELFYeLok81QxN_b_lO-kF3cwVd80B8Tqf',
+  discordWebhookUrl2: 'https://discord.com/api/webhooks/1406976613006053528/4CbtY7i6ryPS41dQY8ZNKKXrfnYCEeWXk1VjYCW5a_0bWLKDJYdiZiwtkNP6eB5PcdKl',
+  discordWebhookUrl3: 'https://discord.com/api/webhooks/1447405008587984988/D8F7W97BriDfke5Oz5Cle6vaW7Ux1hIpNam8vsEFxS-iPGkAWR5xFnqL6lR7uA2ICIAG',
+  reminderWindows: [2880,1440, 720,360, 180, 90, 60, 30, 15, 10, 5, 1],
+  fallbackHour: 21,
+  fallbackMinute: 30,
+  tz: 'Asia/Singapore',
+  tzOffsetHours: 8 // SGT is UTC+8, no DST
+};
+
+const NEW_HEADERS = ['Course Name', 'Item Type', 'Item ID','Title', 'Description','Created', 'Due', 'Teacher', 'Attachments','Attachment Names', 'Task Link', 'Submission State'];
+const CHANGE_HEADERS = ['Timestamp', ...NEW_HEADERS, 'Change Details'];
+const curtime = new Date();
+
+// Column indices in NEW_HEADERS (single source of truth):
+// 0 Course Name | 1 Item Type | 2 Item ID | 3 Title | 4 Description
+// 5 Created | 6 Due | 7 Teacher | 8 Attachments | 9 Attachment Names
+// 10 Task Link | 11 Submission State
+
+function main() {
+  const ss = SpreadsheetApp.getActive();
+  const runSheet = ss.getSheetByName('Run details:');
+  const props = PropertiesService.getScriptProperties();
+  const lastRun = Number(props.getProperty('lastRun_3min') || '0');
+  const betterlastrun = new Date(lastRun);
+  const now = Date.now();
+  const diffMs = now - lastRun;
+  const diffMin = diffMs / 60000;
+
+
+  // 1) read previous status and set dryRun accordingly
+  const lastStatus = runSheet ? runSheet.getRange('B1').getValue() : '';
+  if (lastStatus === 'failed') {
+    CONFIG.dryRun = true;
+    Logger.log ('Error on previous run');
+  } else {
+    CONFIG.dryRun = false;
+    Logger.log ('Normal run');
+  }
+
+
+  if (!shouldRunNow_3min()) {
+    Logger.log(
+      "Run from previous not above set time. Diff(min): " +
+      diffMin.toFixed(3) +
+      ", Run time " + betterdisplaytime(curtime) +
+      ". Previous run time: " + betterdisplaytime(betterlastrun)
+    );
+    if (runSheet) runSheet.getRange('B3').setValue(betterdisplaytime(curtime));
+    return;
+  }
+
+
+  Logger.log(
+    "Running with diff(min):" +
+    diffMin.toFixed(3) +
+    ", Run time " + betterdisplaytime(curtime) +
+    ". Previous run time: " + betterdisplaytime(betterlastrun)
+  );
+
+  try {
+    // logAuditAndReminders should read CONFIG.dryRun and, if true,
+    // skip sending emails but still do reads/logs.
+    Logger.log ('Starting running audit');
+    props.setProperty('lastRun_3min', String(now));
+    logAuditAndReminders();
+    const curttime2 = new Date ();
+    Logger.log ('End time: ' + betterdisplaytime(curttime2));
+
+    if (runSheet) runSheet.getRange('B1').setValue('success');
+    if (runSheet) runSheet.getRange('B2').setValue(betterdisplaytime(curttime2));
+
+  } catch (err) {
+    Logger.log('Run failed: ' + err);
+    const curttime2 = new Date ();
+    if (runSheet) {
+      runSheet.getRange('B4').setValue(betterdisplaytime(curttime2));
+      runSheet.getRange('D4').setValue(err);
+      runSheet.getRange('B1').setValue('failed');
+    }
+    throw new Error (err);
+  }
+}
+
+
+
+
+
+function betterdisplaytime (date){
+  return Utilities.formatDate(date, CONFIG.tz, 'yyyy-MM-dd HH:mm:ss');
+}
+
+
+function logAuditAndReminders() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Work to do");
-  if (!sheet) throw new Error('Sheet "Work to do" not found.');
+  const newSheet = getOrCreateSheet(ss, 'new list');
+  const oldSheet = getOrCreateSheet(ss, 'old list');
+  const changeSheet = getOrCreateSheet(ss, 'changes');
+  const changeLogSheet = getOrCreateSheet(ss, 'changes log');
+  const reminderSheet = getOrCreateSheet(ss, CONFIG.sheetNameReminders);
 
-  const TIMEZONE = 'Asia/Shanghai';
-  const now = new Date();
-  const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+  newSheet.clearContents();
+  changeSheet.clearContents();
+  changeSheet.clearConditionalFormatRules();
+  newSheet.appendRow(NEW_HEADERS);
+  changeSheet.appendRow(CHANGE_HEADERS);
+  if (changeLogSheet.getLastRow() === 0) changeLogSheet.appendRow(CHANGE_HEADERS);
 
-  // ── Headers ──
-  const headers = [
-    'Course Name', 'Title', 'Due', 'Time left: (min)', 'Link',
-    'Status', 'Time left: (days)', 'Time left: (hrs)'
+  // One-time schema migration: if the 'old list' sheet was written by the
+  // pre-Item-ID version (11 columns), rebuild it and skip diffing this run
+  // so nothing is falsely reported as added/changed.
+  const oldHeader = oldSheet.getLastRow() > 0
+    ? oldSheet.getRange(1, 1, 1, oldSheet.getLastColumn()).getValues()[0]
+    : [];
+  const schemaMigrated = oldHeader.indexOf('Item ID') === -1 && oldSheet.getLastRow() > 0;
+  if (schemaMigrated) {
+    Logger.log('Schema change detected: "old list" has no Item ID column. Migrating and skipping diff this run.');
+  }
+  const oldData = schemaMigrated ? [] : oldSheet.getDataRange().getValues().slice(1);
+
+  // Index old rows by Item ID for O(1) lookups
+  const oldById = {};
+  oldData.forEach(r => {
+    const id = String(r[2] || '').trim();
+    if (id) oldById[id] = r;
+  });
+
+  const monitoredCourses = getmonitoredCources()
+  const teacherCache = {};
+  const currentData = [];
+  const reminderRows = [];
+  const notifiedTasks = new Set();
+  const addedTasks = new Set();
+
+  monitoredCourses.forEach(course => {
+    const courseId = course.id;
+    const courseName = course.name;
+
+    try {
+      const teachers = Classroom.Courses.Teachers.list(courseId).teachers || [];
+      const teacherNames = teachers.map(t => t.profile.name.fullName).filter(n => n && n.trim() !== '').join(', ');
+      if (!teacherNames || teacherNames.toLowerCase().includes('unknown')) {
+        throw new Error(`❌ Fatal: Missing or unknown teacher in course "${courseName}" (${courseId})`);
+      }
+      teacherCache[courseId] = teacherNames;
+      throttle();
+
+      const teacher = teacherCache[courseId];
+
+      const announcements = Classroom.Courses.Announcements.list(courseId).announcements || [];
+      throttle();
+      announcements.forEach(ann => {
+        let attachments = extractAttachmentLinks(ann.materials);
+        let attachmentNames = extractAttachmentNames(ann.materials);
+        const taskLink = ann.alternateLink || '';
+
+        if (!ann.text || ann.text.trim() === '') {
+          throw new Error(`❌ Fatal: Blank announcement title in ${courseName}`);
+        }
+        if (!ann.creationTime || ann.creationTime.toString().trim() === '') {
+          throw new Error(`❌ Fatal: Missing createdTime in announcement (${courseName})`);
+        }
+        if (ann.text.trim() === 'Error: Logger is not defined') {
+          throw new Error(`❌ Fatal: Corrupted announcement in ${courseName}`);
+        }
+
+        const match = oldById[ann.id];
+        if (attachmentNames.includes('[Unknown Attachment]') && attachments.includes('drive.google.com') && match) {
+          attachments = match[8];
+          attachmentNames = match[9];
+        }
+
+        const row = [
+          courseName,
+          'Announcement',
+          ann.id,
+          ann.text || '',      // Title column carries announcement text (diffs ignored for announcements)
+          '',                  // Description
+          ann.creationTime,
+          '',
+          teacher,
+          attachments, attachmentNames, taskLink, ''
+        ];
+        currentData.push(row);
+      });
+
+      const coursework = Classroom.Courses.CourseWork.list(courseId).courseWork || [];
+      throttle();
+      coursework.forEach(item => {
+        try {
+          let attachments = extractAttachmentLinks(item.materials);
+          let attachmentNames = extractAttachmentNames(item.materials);
+          const submissions = Classroom.Courses.CourseWork.StudentSubmissions.list(courseId, item.id).studentSubmissions || [];
+          const submissionState = submissions.length ? submissions[0].state : '';
+          const localDue = getLocalDueDateTime(item);
+          const dueDisplay = formatDueDateSmart(localDue);
+          const taskLink = item.alternateLink || '';
+
+          if (!item.title || item.title.trim() === '') {
+            throw new Error(`❌ Fatal: Blank title in course "${courseName}" (${courseId})`);
+          }
+          if (!item.creationTime || item.creationTime.toString().trim() === '') {
+            throw new Error(`❌ Fatal: Missing createdTime in "${item.title}" (${courseName})`);
+          }
+          if (item.description && item.description.trim() === 'Error: Logger is not defined') {
+            throw new Error(`❌ Fatal: Corrupted description in "${item.title}" (${courseName})`);
+          }
+
+          const requiredFields = [item.title, item.creationTime, teacher, taskLink, submissionState];
+          const hasBlanks = requiredFields.some(f => !f || f.toString().trim() === '');
+
+          if (hasBlanks) {
+            throw new Error(`❌ Fatal: Existing task "${item.title}" (${courseName}) has blank required fields`);
+          }
+
+          const match = oldById[item.id];
+          if (attachmentNames.includes('[Unknown Attachment]') && attachments.includes('drive.google.com') && match) {
+            attachments = match[8];
+            attachmentNames = match[9];
+          }
+
+          const row = [
+            courseName, 'Assignment', item.id,
+            item.title || '', item.description || '',
+            item.creationTime, dueDisplay, teacher,
+            attachments, attachmentNames,
+            taskLink, submissionState
+          ];
+          currentData.push(row);
+
+          if (item.workType === 'ASSIGNMENT') {
+            submissions.forEach(sub => {
+              if (sub.state === 'TURNED_IN') return;
+              const minutesUntilDue = localDue ? Math.floor((localDue - new Date()) / 60000) : null;
+
+              reminderRows.push([
+                courseName, item.title, item.id, dueDisplay,
+                minutesUntilDue !== null ? minutesUntilDue : 'No due date',
+                taskLink, sub.state
+              ]);
+            });
+          }
+
+        } catch (err) {
+          throw new Error(`❌ Failed to process item "${item.title}" in ${courseName}: ${err.message}`);
+        }
+      });
+
+    } catch (err) {
+      throw new Error(`❌ Failed to fetch tasks for course: ${courseName} (${courseId}) — ${err.message}`);
+    }
+  });
+
+  currentData.forEach(r => newSheet.appendRow(r));
+
+  const changes = schemaMigrated ? [] : diffAll(oldData, currentData);
+  const pendingNotifications = [];
+  const pendingChangeLogRows = [];
+  changes.forEach(d => {
+    const { oldRow, newRow, message, changedCols } = d;
+    if (!message || message.includes('Description changed from "Error: Logger is not defined" to "N/A"')) return;
+    const timestamp = Utilities.formatDate(new Date(), CONFIG.tz, 'yyyy-MM-dd HH:mm:ss');
+    const fullRow = [timestamp, ...newRow.slice(0, CHANGE_HEADERS.length - 2), message];
+    changeSheet.appendRow(fullRow);
+    pendingChangeLogRows.push({ fullRow, changedCols });
+
+    const taskTitle = newRow[3] || (oldRow && oldRow[3]);
+    const courseName = newRow[0] || (oldRow && oldRow[0]);
+    const link = newRow[10] || (oldRow && oldRow[10]);
+    pendingNotifications.push({oldRow,newRow,courseName,taskTitle,link});
+  });
+
+  // ✅ Send reminders (skip added tasks)
+  const remlastRow = reminderSheet.getLastRow();
+  if (remlastRow > 1) {
+    reminderSheet
+      .getRange(2, 1, remlastRow - 1, reminderSheet.getLastColumn())
+      .clearContent();
+  }
+  let err1 = 0;
+  reminderRows.forEach(row => {
+    const [courseName, title, , dueDisplay, minutesUntilDue, taskLink, submissionState] = row;
+    if (submissionState === 'TURNED_IN') return;
+    if (addedTasks.has(taskLink)) return; // 🛑 Skip reminders for newly added tasks
+    if (notifiedTasks.has(taskLink)) return; // 🛑 Already notified during change logging
+  })
+  if (pendingNotifications.length === 0) {
+      Logger.log('No notifications to send this run');
+    } else if (pendingNotifications.length >= 5) {
+      Logger.log(`Generated ${pendingNotifications.length} notifications; not sending to avoid spam`);
+      err1 =1;
+    } else {
+      pendingNotifications.forEach(notification => {
+        if (CONFIG.discordEnabled && !CONFIG.dryRun) {
+          sendDiscordChange (notification);
+        }
+      });
+      Logger.log (`Sent ${pendingNotifications.length} notifications`);
+    }
+
+
+  Logger.log (err1)
+  if (err1 === 1){
+    Logger.log (pendingNotifications)
+    throw new Error ("Too much notis!");
+  } else {
+  if (schemaMigrated || changes.length > 0) {
+    oldSheet.clearContents();
+    oldSheet.appendRow(NEW_HEADERS);
+    currentData.forEach(r => oldSheet.appendRow(r));
+  }
+  Logger.log ("writting chnagelog")
+  pendingChangeLogRows.forEach(({ fullRow, changedCols }) => {
+    changeLogSheet.appendRow(fullRow);
+    const rowIdxCL = changeLogSheet.getLastRow();
+    highlightChangedCells(changeLogSheet, rowIdxCL, changedCols);
+  });
+  sortAndWriteReminders(reminderRows, reminderSheet);
+  applyChangeFormatting(changeLogSheet);};
+}
+
+
+function getOrCreateSheet(ss, name) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  return sheet;
+}
+
+
+function sendDiscordChange(notification) {
+  try {
+
+    const { oldRow, newRow, courseName, link } = notification;
+
+    const payload = {
+      content:
+        '<@854699073264156693>\n' +
+        `📘 ${courseName}\n` +
+        `🔗 ${link || 'No Link'}`,
+
+      embeds: buildChangeEmbeds(oldRow, newRow)
+    };
+    Logger.log (payload);
+
+    const response = UrlFetchApp.fetch(
+      CONFIG.discordWebhookUrl,
+      {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      }
+    );
+
+    Logger.log(
+      'Discord status=' +
+      response.getResponseCode() +
+      ' body=' +
+      response.getContentText()
+    );
+
+  } catch (err) {
+
+    Logger.log(
+      'Discord send failed: ' +
+      err.toString()
+    );
+
+    throw err;
+  }
+}
+
+function applyChangeFormatting(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return;
+
+  const fullRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
+
+  // 🧹 Clear existing formatting rules
+  sheet.setConditionalFormatRules([]);
+
+  const rules = [];
+
+  // 🔴 Entire row for Removed
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenTextContains('Removed')
+    .setBackground('#8B0000')
+    .setFontColor('#FFFFFF')
+    .setRanges([fullRange])
+    .build());
+
+  // 🟩 Entire row for Added
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenTextContains('Added')
+    .setBackground('#00FF00')
+    .setRanges([fullRange])
+    .build());
+
+  // 🟥 Specific cells for Updated fields — target last column
+  const changeDetailsCol = CHANGE_HEADERS.length; // usually column 14
+  const cellRange = sheet.getRange(2, changeDetailsCol, lastRow - 1, 1);
+
+  const fieldNames = [
+    'Title', 'Description', 'Created', 'Due', 'Teacher',
+    'Attachments', 'Attachment Names', 'Task Link', 'Submission State'
   ];
-  sheet.clear();
-  sheet.getRange(1, 1, 1, headers.length)
-    .setValues([headers])
-    .setFontWeight('bold')
-    .setBackground('#4285f4')
-    .setFontColor('white');
 
-  // ── Fetch active courses (student view) ──
-  let courses = [];
+  fieldNames.forEach(field => {
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+      .whenTextContains(`${field} changed from`)
+      .setBackground('#FFCCCC')
+      .setRanges([cellRange])
+      .build());
+  });
+
+  sheet.setConditionalFormatRules(rules);
+}
+
+
+
+/**
+ * Compare two row sets (old vs new) and return change messages
+ * plus the exact sheet-column indices for cells that changed.
+ *
+ * Matching is done by Item ID (column 2). Item IDs are unique across
+ * courses and stable, unlike links.
+ */
+
+function diffAll(oldData, newData) {
+  const makeKey = r => String(r[2] || '').trim(); // Item ID
+  const oldMap = {};
+  oldData.forEach(r => {
+    const key = makeKey(r);
+    if (key) oldMap[key] = r;
+  });
+  const newMap = {};
+  newData.forEach(r => {
+    const key = makeKey(r);
+    if (key) newMap[key] = r;
+  });
+
+  const results = [];
+
+  Object.keys(newMap).forEach(key => {
+    const oldRow = oldMap[key];
+    const newRow = newMap[key];
+    if (!oldRow) {
+      const creationTimeVal = newRow[5];
+      const creationDate = creationTimeVal ? new Date(creationTimeVal) : null;
+      const ageMs = creationDate && !isNaN(creationDate) ? Date.now() - creationDate.getTime() : null;
+      if (ageMs === null || ageMs > 10 * 60 * 1000) {
+        Logger.log(`⚠️ Skipping '🆕 Added' for "${newRow[3]}" — creation time "${creationTimeVal}" is not within 10 mins (age: ${ageMs !== null ? Math.round(ageMs/60000) + 'min' : 'unknown'})`);
+        return;
+      }
+      results.push({ oldRow: null, newRow, message: '🆕 Added', changedCols: [] });
+      return;
+    }
+    const { message, changedCols } = getFieldDifferences(oldRow, newRow);
+    if (message) results.push({ oldRow, newRow, message, changedCols });
+  });
+
+  return results;
+}
+
+function getFieldDifferences(oldRow, newRow) {
+  if (!Array.isArray(oldRow) || !Array.isArray(newRow)) {
+    return { message: '', changedCols: [] };
+  }
+
+  const isAnnouncement = newRow[1] === 'Announcement';
+
+  const fields = [
+    'Title',
+    'Description',
+    'Due',
+    'Teacher',
+    'Attachments',
+    'Attachment Names',
+    'Task Link',
+    'Submission State'
+  ];
+
+  const diffs = [];
+  const changedCols = [];
+
+  // CHANGE_HEADERS layout: col 1 = Timestamp, cols 2..13 = NEW_HEADERS, col 14 = Change Details
+  const timestampOffset = 1;
+
+  fields.forEach((fieldName) => {
+    let rowIdx;
+
+    switch (fieldName) {
+      case 'Title':
+        rowIdx = 3;
+        break;
+      case 'Description':
+        rowIdx = 4;
+        break;
+      case 'Due':
+        rowIdx = 6;
+        break;
+      case 'Teacher':
+        rowIdx = 7;
+        break;
+      case 'Attachments':
+        rowIdx = 8;
+        break;
+      case 'Attachment Names':
+        rowIdx = 9;
+        break;
+      case 'Task Link':
+        rowIdx = 10;
+        break;
+      case 'Submission State':
+        rowIdx = 11;
+        break;
+    }
+
+    let oldVal = String(oldRow[rowIdx] || '').trim();
+    let newVal = String(newRow[rowIdx] || '').trim();
+
+    // Ignore Title diffs for announcements
+    if (isAnnouncement && fieldName === 'Title') {
+      return;
+    }
+
+    // Clean Google Sheets leading apostrophe
+    if (fieldName === 'Title' || fieldName === 'Description') {
+      oldVal = normalizeComparisonText(stripLeadingQuote(oldVal));
+      newVal = normalizeComparisonText(stripLeadingQuote(newVal));
+    }
+
+    // Compare attachment counts only
+    if (
+      fieldName === 'Attachments' ||
+      fieldName === 'Attachment Names'
+    ) {
+      const oldCount = oldVal
+        ? oldVal.split('\n').filter(Boolean).length
+        : 0;
+
+      const newCount = newVal
+        ? newVal.split('\n').filter(Boolean).length
+        : 0;
+
+      if (oldCount !== newCount) {
+        diffs.push(
+          `${fieldName} changed from ${oldCount} to ${newCount}`
+        );
+
+        changedCols.push(
+          timestampOffset + rowIdx + 1
+        );
+      }
+
+      return;
+    }
+
+    // Normalize task links
+    if (fieldName === 'Task Link') {
+      oldVal = normalizeDriveLink(oldVal);
+      newVal = normalizeDriveLink(newVal);
+    }
+
+    if (fieldName === 'Due'){
+      const oldNorm = normalizeDueDate(oldVal);
+      const newNorm = normalizeDueDate(newVal);
+      if (oldNorm !== newNorm){
+        diffs.push (`Due changed from "${oldNorm}" to "${newNorm}"`);
+        changedCols.push(timestampOffset + rowIdx + 1);
+      }
+      return;
+    }
+
+    if (oldVal !== newVal) {
+      diffs.push(
+        `${fieldName} changed from "${oldVal}" to "${newVal}"`
+      );
+
+      changedCols.push(
+        timestampOffset + rowIdx + 1
+      );
+    }
+  });
+
+  return {
+    message: diffs.join('; '),
+    changedCols
+  };
+}
+
+/**
+ * Pulls out the core file ID and returns a normalized
+ * drive.google.com link so different URL forms match.
+ */
+function normalizeDriveLink(link) {
+  if (!link) return '';
+  const match = link.match(/[-\w]{25,}/);
+  return match
+    ? `https://drive.google.com/open?id=${match[0]}`
+    : link.trim();
+}
+
+
+
+
+
+/**
+ * Strips a leading single-quote that Google Sheets uses as a text-format marker.
+ */
+function stripLeadingQuote(str) {
+  return String(str || '').replace(/^'/, '');
+}
+
+function parseDate(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+
+  const parts = dateStr.trim().split(/[\s/:]+/);
+  if (parts.length < 5) return null;
+
+  const [year, month, day, hour, minute] = parts.map(Number);
+  const date = new Date(year, month - 1, day, hour, minute);
+  return isNaN(date.getTime()) ? null : date;
+}
+
+
+function getLocalDueDateTime(item) {
+  if (!item.dueDate) return null;
+
+  const year = item.dueDate.year;
+  const month = item.dueDate.month - 1;
+  const day = item.dueDate.day;
+
+  // Classroom API already returns dueDate/dueTime in UTC.
+  // Note: 00:00 UTC (08:00 SGT) is returned as an empty object `{}`.
+  if (item.dueTime) {
+    const h = item.dueTime.hours ?? 0;
+    const m = item.dueTime.minutes ?? 0;
+    return new Date(Date.UTC(year, month, day, h, m));
+  }
+
+  // Fallback time is written in SGT, so subtract the SGT offset here.
+  return new Date(
+    Date.UTC(year, month, day, CONFIG.fallbackHour - CONFIG.tzOffsetHours, CONFIG.fallbackMinute)
+  );
+}
+
+
+
+
+
+function formatDueDateSmart(localDue) {
+  if (!localDue || !(localDue instanceof Date) || isNaN(localDue.getTime())) return 'No due date';
+
+  const datePart = Utilities.formatDate(localDue, CONFIG.tz, 'yyyy-MM-dd');
+  const timePart = Utilities.formatDate(localDue, CONFIG.tz, 'HH:mm');
+  const isDefaultTime = timePart === '23:59'; // checked in SGT, not script timezone
+
+  return isDefaultTime ? datePart : `${datePart} ${timePart}`;
+}
+
+function sortAndWriteReminders(reminderRows, reminderSheet) {
+  const cutoffMinutes = -7 * 24 * 60; // 7 days ago, in minutes
+
+  // Use the epoch-based minutesUntilDue (col 4) instead of re-parsing the
+  // display string, which was previously read in the script's timezone.
+  const filtered = reminderRows.filter(row => {
+    const state = row[6];
+    const mins = row[4];
+
+    const isReturned = state === 'RETURNED';
+    const isPastDue = typeof mins === 'number' && mins < cutoffMinutes;
+
+    return !isReturned && !isPastDue;
+  });
+
+  filtered.sort((a, b) => {
+    const aNum = typeof a[4] === 'number';
+    const bNum = typeof b[4] === 'number';
+
+    if (aNum && bNum) return a[4] - b[4];
+    if (aNum) return -1;
+    if (bNum) return 1;
+    return 0;
+  });
+
+  if (filtered.length) {
+    reminderSheet.getRange(2, 1, filtered.length, filtered[0].length).setValues(filtered);
+  }
+}
+
+/**
+ * Given an array of Classroom materials, return a newline-joined list of friendly names:
+ * • driveFile.driveFile.title
+ * • link.title
+ * • youtubeVideo.title
+ * • "Google Form"
+ * • fallback to filename or domain
+ */
+function extractAttachmentNames(materials) {
+  return (materials || [])
+    .map(m => {
+      if (m.driveFile?.driveFile?.title)            return m.driveFile.driveFile.title;
+      if (m.link?.title)                            return m.link.title;
+      if (m.youtubeVideo?.title)                    return `YouTube: ${m.youtubeVideo.title}`;
+      if (m.form?.formUrl)                          return 'Google Form';
+      if (m.link?.url) {
+        // fallback to last path segment or domain
+        const parts = m.link.url.split('/');
+        return parts.pop() || parts[2] || '[Link]';
+      }
+      return '[Unknown Attachment]';
+    })
+    .filter(name => !!name)
+    .join('\n');
+}
+
+function highlightChangedCells(sheet, rowIndex, changedCols) {
+  changedCols.forEach(col => {
+    const cell = sheet.getRange(rowIndex, col);
+    cell.setBackground('#FFCCCC'); // light red
+  });
+}
+
+function truncateDiscord(text, maxLength = 1000) {
+  text = String(text || '-');
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return text.substring(0, maxLength - 3) + '...';
+}
+
+/**
+ * Extracts all attachment URLs from Classroom materials[].
+ * Handles driveFile, link, youtubeVideo, and form types.
+ */
+function extractAttachmentLinks(materials) {
+  return (materials || []).map(m => {
+    if (m.driveFile?.driveFile?.alternateLink) return m.driveFile.driveFile.alternateLink;
+    if (m.link?.url) return m.link.url;
+    if (m.youtubeVideo?.alternateLink) return m.youtubeVideo.alternateLink;
+    if (m.form?.formUrl) return m.form.formUrl;
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function throttle (){
+  Utilities.sleep(75);
+}
+
+function getmonitoredCources(){
+  // Fetch ALL active courses across pages
+  const courses = [];
   let pageToken = null;
   do {
     const response = Classroom.Courses.list({
-      studentId: 'me',
-      courseStates: 'ACTIVE',
-      pageToken: pageToken,
-      pageSize: 100
+      courseStates: ['ACTIVE'],
+      pageSize: 100,
+      pageToken: pageToken
     });
-    if (response.courses) courses = courses.concat(response.courses);
+    if (response.courses) {
+     courses.push(...response.courses);
+    }
     pageToken = response.nextPageToken;
   } while (pageToken);
+  const excludedCourse = 'Project 27';
+  const filteredCourses = courses.filter(course => course.name !== excludedCourse);
 
-  let allAssignments = [];
+  // No need to filter — the API already gave us only ACTIVE courses
+  return filteredCourses;
+}
 
-  // ── Fetch student submissions & coursework details ──
-  for (const course of courses) {
-    try {
-      let submissions = [];
-      let subToken = null;
-      do {
-        const subResponse = Classroom.Courses.CourseWork.StudentSubmissions.list(
-          course.id,
-          '-',
-          { pageToken: subToken, pageSize: 100 }
-        );
-        if (subResponse.studentSubmissions) {
-          submissions = submissions.concat(subResponse.studentSubmissions);
+function normalizeComparisonText(str) {
+  return String(str || '')
+    .normalize('NFC')
+
+    // HTML cleanup
+    .replace(/<br\s*\/?>/gi, '<br>')
+
+    // Emoji variation selector
+    .replace(/\uFE0F/g, '')
+
+    // Zero-width joiner
+    .replace(/\u200D/g, '')
+
+    // Non-breaking spaces
+    .replace(/\u00A0/g, ' ')
+
+    // Collapse whitespace
+    .replace(/\s+/g, ' ')
+
+    .trim();
+}
+function buildChangeEmbeds(oldRow, newRow) {
+
+  oldRow = oldRow || Array(12).fill('');
+  newRow = newRow || Array(12).fill('');
+
+  const timestamp = Utilities.formatDate(
+    new Date(),
+    CONFIG.tz,
+    'yyyy-MM-dd HH:mm:ss'
+  );
+
+  return [
+    {
+      title: '📝 Before',
+      color: 0xff6666,
+      fields: [
+        {
+          name: 'Course',
+          value: truncateDiscord(oldRow[0] || '-'),
+          inline: true
+        },
+        {
+          name: 'Type',
+          value: truncateDiscord(oldRow[1] || '-'),
+          inline: true
+        },
+        {
+          name: 'Status',
+          value: truncateDiscord(oldRow[11] || '-'),
+          inline: true
+        },
+        {
+          name: 'Title',
+          value: truncateDiscord(oldRow[3] || '-'),
+          inline: false
+        },
+        {
+          name: 'Description',
+          value: truncateDiscord(oldRow[4] || '-'),
+          inline: false
+        },
+        {
+          name: 'Created',
+          value: truncateDiscord(oldRow[5] || '-'),
+          inline: true
+        },
+        {
+          name: 'Due',
+          value: normalizeDisplayDue(oldRow[6]),
+          inline: true
+        },
+        {
+          name: 'Teacher',
+          value: truncateDiscord(oldRow[7] || '-'),
+          inline: true
+        },
+        {
+          name: 'Attachment Names',
+          value: truncateDiscord(oldRow[9] || 'None', 1024),
+          inline: false
+        },
+        {
+          name: 'Attachment Links',
+          value: truncateDiscord(oldRow[8] || 'None', 1024),
+          inline: false
+        },
+        {
+          name: 'Task Link',
+          value: truncateDiscord(oldRow[10] || 'None'),
+          inline: false
         }
-        subToken = subResponse.nextPageToken;
-      } while (subToken);
+      ]
+    },
 
-      const seenWorkIds = new Set();
-
-      for (const sub of submissions) {
-        if (sub.state === 'TURNED_IN' || sub.state === 'RETURNED') continue;
-        if (seenWorkIds.has(sub.courseWorkId)) continue;
-        seenWorkIds.add(sub.courseWorkId);
-
-        let work;
-        try {
-          work = Classroom.Courses.CourseWork.get(course.id, sub.courseWorkId);
-        } catch (e) {
-          console.warn(`Cannot fetch work ${sub.courseWorkId} in ${course.name}: ${e.message}`);
-          continue;
+    {
+      title: '✅ After',
+      color: 0x66ff66,
+      fields: [
+        {
+          name: 'Course',
+          value: truncateDiscord(newRow[0] || '-'),
+          inline: true
+        },
+        {
+          name: 'Type',
+          value: truncateDiscord(newRow[1] || '-'),
+          inline: true
+        },
+        {
+          name: 'Status',
+          value: truncateDiscord(newRow[11] || '-'),
+          inline: true
+        },
+        {
+          name: 'Title',
+          value: truncateDiscord(newRow[3] || '-'),
+          inline: false
+        },
+        {
+          name: 'Description',
+          value: truncateDiscord(newRow[4] || '-'),
+          inline: false
+        },
+        {
+          name: 'Created',
+          value: truncateDiscord(newRow[5] || '-'),
+          inline: true
+        },
+        {
+          name: 'Due',
+          value: normalizeDisplayDue(newRow[6]),
+          inline: true
+        },
+        {
+          name: 'Teacher',
+          value: truncateDiscord(newRow[7] || '-'),
+          inline: true
+        },
+        {
+          name: 'Attachment Names',
+          value: truncateDiscord(newRow[9] || 'None', 1024),
+          inline: false
+        },
+        {
+          name: 'Attachment Links',
+          value: truncateDiscord(newRow[8] || 'None', 1024),
+          inline: false
+        },
+        {
+          name: 'Task Link',
+          value: truncateDiscord(newRow[10] || 'None'),
+          inline: false
         }
-
-        let dueDateObj = null;
-        let dueString = '';
-
-        if (work.dueDate) {
-          const y = work.dueDate.year;
-          const m = work.dueDate.month - 1;
-          const d = work.dueDate.day;
-          let hh = 23, mm = 59;
-          if (work.dueTime) {
-            hh = work.dueTime.hours ?? 23;
-            mm = work.dueTime.minutes ?? 59;
-          }
-
-          // FIX: dueTime from API is already UTC — do NOT add/subtract hours
-          const utcMs = Date.UTC(y, m, d, hh, mm);
-          dueDateObj = new Date(utcMs);
-          dueString = Utilities.formatDate(dueDateObj, TIMEZONE, 'yyyy-MM-dd HH:mm');
-        }
-
-        let timeLeftMin = '';
-        let timeLeftHrs = '';
-        let timeLeftDays = '';
-        let status = '';
-
-        if (dueDateObj) {
-          const diffMs = dueDateObj.getTime() - now.getTime();
-          const diffMin = Math.round(diffMs / 60000);
-          const diffHrs = Math.round((diffMs / 3600000) * 10) / 10;
-          const diffDays = Math.round((diffMs / 86400000) * 10) / 10;
-
-          timeLeftMin = diffMin;
-          timeLeftHrs = diffHrs;
-          timeLeftDays = diffDays;
-
-          if (diffMs < 0) status = 'OVERDUE';
-          else if (diffDays <= 1) status = 'DUE SOON';
-          else status = 'UPCOMING';
-        } else {
-          status = 'NO DUE DATE';
-        }
-
-        const link = `https://classroom.google.com/c/${course.id}/a/${work.id}/details`;
-
-        allAssignments.push({
-          courseName: course.name,
-          title: work.title,
-          due: dueString,
-          timeLeftMin: timeLeftMin,
-          link: link,
-          status: status,
-          timeLeftDays: timeLeftDays,
-          timeLeftHrs: timeLeftHrs,
-          dueDateObj: dueDateObj
-        });
+      ],
+      footer: {
+        text: `Audit Run: ${timestamp} (${CONFIG.tz})`
       }
-    } catch (err) {
-      console.warn(`Skipping course "${course.name}": ${err.message}`);
+    }
+  ];
+}
+
+function normalizeDueDate(value) {
+  value = String(value || '').trim();
+
+  // No due date
+  if (!value || value === 'No due date') {
+    return 'No due date';
+  }
+
+  // Already normalised YYYY-MM-DD
+  const dateOnlyMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnlyMatch) {
+    return value;
+  }
+
+  // SGT wall-time format produced by formatDueDateSmart ("yyyy-MM-dd HH:mm").
+  // Parse it explicitly as SGT instead of relying on the script timezone.
+  const wallMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})/);
+  if (wallMatch) {
+    const d = new Date(Date.UTC(
+      Number(wallMatch[1]),
+      Number(wallMatch[2]) - 1,
+      Number(wallMatch[3]),
+      Number(wallMatch[4]) - CONFIG.tzOffsetHours,
+      Number(wallMatch[5])
+    ));
+    if (!isNaN(d.getTime())) {
+      return Utilities.formatDate(d, CONFIG.tz, 'yyyy-MM-dd');
     }
   }
 
-  // ── Sort: Overdue (within 3d, latest first) → Upcoming (earliest first) → No due date ──
-  const overdue = [];
-  const upcoming = [];
-  const noDueDate = [];
+  // Full ISO string (Classroom commonly returns these)
+  if (value.includes('T')) {
+    const d = new Date(value);
 
-  for (const a of allAssignments) {
-    if (!a.dueDateObj) {
-      noDueDate.push(a);
-    } else if (a.dueDateObj.getTime() < now.getTime() && a.dueDateObj.getTime() >= threeDaysAgo.getTime()) {
-      overdue.push(a);
-    } else if (a.dueDateObj.getTime() >= now.getTime()) {
-      upcoming.push(a);
+    if (!isNaN(d.getTime())) {
+      return Utilities.formatDate(d, CONFIG.tz, 'yyyy-MM-dd');
     }
   }
 
-  overdue.sort((a, b) => b.dueDateObj.getTime() - a.dueDateObj.getTime());
-  upcoming.sort((a, b) => a.dueDateObj.getTime() - b.dueDateObj.getTime());
+  // Generic parse attempt
+  const d = new Date(value);
 
-  const sorted = [...overdue, ...upcoming, ...noDueDate];
-  let nextRow = 2;
-
-  // ── Write data ──
-  if (sorted.length === 0) {
-    sheet.getRange(nextRow, 1).setValue('No pending assignments found.');
-    nextRow++;
-  } else {
-    const rows = sorted.map(a => [
-      a.courseName,
-      a.title,
-      a.due,
-      a.timeLeftMin,
-      a.link,
-      a.status,
-      a.timeLeftDays,
-      a.timeLeftHrs
-    ]);
-
-    sheet.getRange(nextRow, 1, rows.length, headers.length).setValues(rows);
-    nextRow += rows.length;
-
-    // Clickable links
-    const linkRange = sheet.getRange(2, 5, rows.length, 1);
-    const richText = [];
-    for (let i = 0; i < rows.length; i++) {
-      richText.push([SpreadsheetApp.newRichTextValue()
-        .setText('Open Assignment')
-        .setLinkUrl(rows[i][4])
-        .build()]);
-    }
-    linkRange.setRichTextValues(richText);
-
-    // Status colors
-    const statusRange = sheet.getRange(2, 6, rows.length, 1);
-    const statusValues = statusRange.getValues();
-    const colors = statusValues.map(([s]) => {
-      if (s === 'OVERDUE') return ['#ffc7ce'];
-      if (s === 'DUE SOON') return ['#ffeb9c'];
-      if (s === 'UPCOMING') return ['#c6efce'];
-      return ['#d9d9d9'];
-    });
-    statusRange.setBackgrounds(colors);
-
-    sheet.autoResizeColumns(1, headers.length);
+  if (!isNaN(d.getTime())) {
+    return Utilities.formatDate(d, CONFIG.tz, 'yyyy-MM-dd');
   }
 
-  sheet.setFrozenRows(1);
+  // Fallback for custom date strings
+  const parsed = parseDate(value);
 
-  // ── Last run time at bottom ──
-  const lastRun = Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd HH:mm:ss');
+  if (parsed && !isNaN(parsed.getTime())) {
+    return Utilities.formatDate(parsed, CONFIG.tz, 'yyyy-MM-dd');
+  }
 
-  sheet.getRange(nextRow + 1, 1)
-    .setValue(`By KING ALLIANCE ALL RIGHTS RESERVED`)
-    .setFontFamily('Roboto')
-    .setFontSize(20)
-    .setFontColor('#666666');
+  // Final fallback
+  return value;
+}
 
-  sheet.getRange(nextRow + 2, 1)
-    .setValue(`Last updated: ${lastRun} (UTC+8). KINGS ALLIANCE bare no responsibility on errors, delays, or missing.`)
-    .setFontStyle('italic')
-    .setFontColor('#666666');
+function normalizeDisplayDue(value) {
+  if (!value) return 'No due date';
 
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    const datePart = Utilities.formatDate(value, CONFIG.tz, 'yyyy-MM-dd');
+    const timePart = Utilities.formatDate(value, CONFIG.tz, 'HH:mm');
+    return timePart === '23:59' || timePart === '00:00'
+      ? datePart
+      : `${datePart} ${timePart}`;
+  }
+
+  const str = String(value).trim();
+  if (!str || str === 'No due date') return 'No due date';
+
+  // Already formatted in SGT by formatDueDateSmart
+  if (/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$/.test(str)) {
+    return str;
+  }
+
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) {
+    const datePart = Utilities.formatDate(d, CONFIG.tz, 'yyyy-MM-dd');
+    const timePart = Utilities.formatDate(d, CONFIG.tz, 'HH:mm');
+    return timePart === '23:59' ? datePart : `${datePart} ${timePart}`;
+  }
+
+  return str;
 }
