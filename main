@@ -22,6 +22,8 @@ const curtime = new Date();
 // 5 Created | 6 Due | 7 Teacher | 8 Attachments | 9 Attachment Names
 // 10 Task Link | 11 Submission State
 
+const STALE_RUN_MS = 6.5 * 60 * 1000; // GAS hard timeout is 6 mins
+
 function main() {
   const ss = SpreadsheetApp.getActive();
   const runSheet = ss.getSheetByName('Run details:');
@@ -32,58 +34,67 @@ function main() {
   const diffMs = now - lastRun;
   const diffMin = diffMs / 60000;
 
+  const lastStatus = runSheet ? String(runSheet.getRange('B1').getValue()).trim() : '';
+  const startedAt = Number(props.getProperty('runStartedAt') || '0');
 
-  // 1) read previous status and set dryRun accordingly
-  const lastStatus = runSheet ? runSheet.getRange('B1').getValue() : '';
-  if (lastStatus === 'failed') {
-    CONFIG.dryRun = true;
-    Logger.log ('Error on previous run');
-  } else {
-    CONFIG.dryRun = false;
-    Logger.log ('Normal run');
-  }
-
-
-  if (!shouldRunNow_3min()) {
+  // 1) Skip if the previous run is still active (unless it timed out past 6.5 mins)
+  if (lastStatus === 'running' && (now - startedAt) < STALE_RUN_MS) {
     Logger.log(
-      "Run from previous not above set time. Diff(min): " +
+      'Previous run still in progress. Diff(min): ' +
       diffMin.toFixed(3) +
-      ", Run time " + betterdisplaytime(curtime) +
-      ". Previous run time: " + betterdisplaytime(betterlastrun)
+      ', Run time ' + betterdisplaytime(curtime) +
+      '. Previous run time: ' + betterdisplaytime(betterlastrun)
     );
     if (runSheet) runSheet.getRange('B3').setValue(betterdisplaytime(curtime));
     return;
   }
 
+  // 2) Read previous status and set dryRun accordingly
+  if (lastStatus === 'failed' || lastStatus === 'running') {
+    CONFIG.dryRun = true;
+    Logger.log('Error or timeout on previous run — running in dryRun mode');
+  } else {
+    CONFIG.dryRun = false;
+    Logger.log('Normal run');
+  }
 
   Logger.log(
-    "Running with diff(min):" +
+    'Running with diff(min): ' +
     diffMin.toFixed(3) +
-    ", Run time " + betterdisplaytime(curtime) +
-    ". Previous run time: " + betterdisplaytime(betterlastrun)
+    ', Run time ' + betterdisplaytime(curtime) +
+    '. Previous run time: ' + betterdisplaytime(betterlastrun)
   );
 
   try {
-    // logAuditAndReminders should read CONFIG.dryRun and, if true,
-    // skip sending emails but still do reads/logs.
-    Logger.log ('Starting running audit');
+    // 3) Mark sheet as 'running' and flush immediately so the next 1-min tick sees it
     props.setProperty('lastRun_3min', String(now));
+    props.setProperty('runStartedAt', String(now));
+    if (runSheet) {
+      runSheet.getRange('B1').setValue('running');
+      SpreadsheetApp.flush();
+    }
+
+    Logger.log('Starting running audit');
     logAuditAndReminders();
-    const curttime2 = new Date ();
-    Logger.log ('End time: ' + betterdisplaytime(curttime2));
 
-    if (runSheet) runSheet.getRange('B1').setValue('success');
-    if (runSheet) runSheet.getRange('B2').setValue(betterdisplaytime(curttime2));
+    const curttime2 = new Date();
+    Logger.log('End time: ' + betterdisplaytime(curttime2));
 
+    if (runSheet) {
+      runSheet.getRange('B1').setValue('success');
+      runSheet.getRange('B2').setValue(betterdisplaytime(curttime2));
+      SpreadsheetApp.flush();
+    }
   } catch (err) {
     Logger.log('Run failed: ' + err);
-    const curttime2 = new Date ();
+    const curttime2 = new Date();
     if (runSheet) {
       runSheet.getRange('B4').setValue(betterdisplaytime(curttime2));
       runSheet.getRange('D4').setValue(err);
       runSheet.getRange('B1').setValue('failed');
+      SpreadsheetApp.flush();
     }
-    throw new Error (err);
+    throw new Error(err);
   }
 }
 
